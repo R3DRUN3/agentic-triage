@@ -39,7 +39,6 @@ jobs:
 
       - run: pip install -r requirements-dev.txt
 
-      # Generate reports without stopping at the first finding.
       - name: Collect lint reports
         run: |
           mkdir -p reports
@@ -54,7 +53,6 @@ jobs:
           output-file: reports/hadolint.sarif
           no-fail: false
 
-      # Always preserve reports, including when lint fails.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -62,13 +60,11 @@ jobs:
           path: reports/
           if-no-files-found: ignore
 
-      # Actual enforcement.
       - name: Enforce lint
         run: |
           set -e
           ruff check .
           mypy
-
 
   # ============================================================
   # 2. UNIT TESTS
@@ -103,7 +99,6 @@ jobs:
           path: reports/
           if-no-files-found: ignore
 
-
   # ============================================================
   # 3. SAST - BANDIT
   # ============================================================
@@ -134,7 +129,6 @@ jobs:
           name: reports-sast
           path: reports/
           if-no-files-found: ignore
-
 
   # ============================================================
   # 4. SECRET SCAN - GITLEAKS
@@ -181,7 +175,6 @@ jobs:
           name: reports-secrets
           path: reports/
           if-no-files-found: ignore
-
 
   # ============================================================
   # 5. TRIVY FILESYSTEM SCAN
@@ -231,7 +224,6 @@ jobs:
           name: reports-trivy-fs
           path: reports/
           if-no-files-found: ignore
-
 
   # ============================================================
   # 6. TRIVY CONTAINER IMAGE SCAN
@@ -283,12 +275,12 @@ jobs:
           path: reports/
           if-no-files-found: ignore
 
-
   # ============================================================
   # 7. AGENTIC TRIAGE - CODEX
   #
-  # Runs ONLY after all six independent jobs have completed.
-  # Still runs even if one or more jobs failed.
+  # Recommendation-only mode.
+  # Codex can write reports inside triage/ but must NEVER
+  # modify application code, dependencies, tests or configuration.
   # ============================================================
   triage:
     name: Agentic triage
@@ -315,7 +307,7 @@ jobs:
       AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
       AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT || vars.AZURE_OPENAI_DEPLOYMENT }}
       CODEX_VERSION: ${{ vars.CODEX_VERSION || 'latest' }}
-      CODEX_SANDBOX: ${{ vars.CODEX_SANDBOX || 'workspace-write' }}
+      CODEX_SANDBOX: workspace-write
 
     steps:
       - uses: actions/checkout@v4
@@ -328,9 +320,6 @@ jobs:
           cache: pip
           cache-dependency-path: requirements*.txt
 
-      - name: Install deps (so the agent can run tests offline)
-        run: pip install -r requirements-dev.txt
-
       - uses: actions/download-artifact@v4
         with:
           pattern: reports-*
@@ -342,6 +331,13 @@ jobs:
 
       - name: Publish raw findings summary
         run: cat triage-input/findings.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Record the original repository state.
+      - name: Record repository baseline
+        run: |
+          git status --porcelain --untracked-files=all \
+            | grep -v '^?? triage/' \
+            > "$RUNNER_TEMP/git-baseline.txt" || true
 
       - name: Preflight Azure model endpoint
         id: cfg
@@ -386,7 +382,7 @@ jobs:
             WIRE=chat
             echo "::warning::Deployment only supports chat/completions. Recent Codex versions require the Responses API. Pin an older CODEX_VERSION or use a Responses-capable deployment."
           else
-            echo "::error::Deployment '$AZURE_OPENAI_DEPLOYMENT' failed on both /responses and /chat/completions. Check the deployment NAME, the endpoint and the key."
+            echo "::error::Deployment '$AZURE_OPENAI_DEPLOYMENT' failed on both /responses and /chat/completions. Check the deployment NAME, endpoint and key."
             exit 1
           fi
 
@@ -428,7 +424,8 @@ jobs:
 
           codex --version
 
-      - name: Run Codex triage
+      # Codex can create reports but is instructed never to fix code.
+      - name: Run Codex triage (recommendations only)
         if: steps.cfg.outputs.enabled == 'true'
         run: |
           mkdir -p triage
@@ -439,52 +436,86 @@ jobs:
             --output-last-message triage/last-message.md \
             - < .github/codex/triage-prompt.md
 
-      - name: Capture proposed fixes as a patch
-        if: steps.cfg.outputs.enabled == 'true'
-        run: |
-          mkdir -p triage
-
-          git diff --binary > triage/fixes.patch
-
-          echo "Patch size: $(wc -c < triage/fixes.patch) bytes"
-
-          git diff --stat
-
-      - name: Verify proposed fixes (tests on patched tree)
+      # Fail if any repository changes occurred outside triage/.
+      - name: Verify repository integrity
         id: verify
         if: steps.cfg.outputs.enabled == 'true'
-        continue-on-error: true
-        run: python -m pytest -q 2>&1 | tee triage/verify-tests.txt
-
-      - name: Validate and summarize triage output
-        if: steps.cfg.outputs.enabled == 'true'
         run: |
-          if [ ! -f triage/triage.json ] || [ ! -f triage/report.md ]; then
-            echo "::error::Agent did not produce triage/triage.json and triage/report.md"
+          git status --porcelain --untracked-files=all \
+            | grep -v '^?? triage/' \
+            > "$RUNNER_TEMP/git-after.txt" || true
+
+          if ! diff -u "$RUNNER_TEMP/git-baseline.txt" "$RUNNER_TEMP/git-after.txt"; then
+            echo "::error::Repository files were modified during triage."
             exit 1
           fi
 
-          jq -e '.findings | type == "array"' triage/triage.json > /dev/null
+          echo "Repository integrity check passed."
 
-          EXPECTED=$(jq 'length' triage-input/findings.json)
-          ACTUAL=$(jq '.findings | length' triage/triage.json)
+      # Validate deliverables and ensure no fix was applied.
+      - name: Validate and summarize triage output
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
 
-          if [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "::warning::Agent triaged $ACTUAL of $EXPECTED findings"
+          if [ ! -s triage/triage.json ] || [ ! -s triage/report.md ]; then
+            echo "::error::Agent did not produce valid non-empty triage deliverables."
+            exit 1
           fi
 
+          jq -e '
+            (.summary | type == "object") and
+            (.findings | type == "array") and
+            all(.findings[];
+              (.id | type == "string") and
+              (.verdict == "true_positive" or
+               .verdict == "false_positive" or
+               .verdict == "needs_human") and
+              (.confidence >= 0 and .confidence <= 1) and
+              (.fix_applied == false)
+            ) and
+            (.summary.total == (.findings | length)) and
+            (.summary.true_positive == ([.findings[] | select(.verdict == "true_positive")] | length)) and
+            (.summary.false_positive == ([.findings[] | select(.verdict == "false_positive")] | length)) and
+            (.summary.needs_human == ([.findings[] | select(.verdict == "needs_human")] | length))
+          ' triage/triage.json > /dev/null
+
+          EXPECTED=$(jq -r '[.[].id] | sort | .[]' triage-input/findings.json)
+          ACTUAL=$(jq -r '[.findings[].id] | sort | .[]' triage/triage.json)
+
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Finding IDs do not match input findings."
+            diff <(printf '%s\n' "$EXPECTED") <(printf '%s\n' "$ACTUAL") || true
+            exit 1
+          fi
+
+          EXPECTED_COUNT=$(jq '[.[].id] | unique | length' triage-input/findings.json)
+          INPUT_COUNT=$(jq 'length' triage-input/findings.json)
+
+          if [ "$EXPECTED_COUNT" != "$INPUT_COUNT" ]; then
+            echo "::error::Input findings contain duplicate IDs."
+            exit 1
+          fi
+
+          echo "## Agentic triage"
+          echo ""
+          echo "| Verdict | Count |"
+          echo "|---|---|"
+          jq -r '.summary |
+            "| true_positive | \(.true_positive) |\n" +
+            "| false_positive | \(.false_positive) |\n" +
+            "| needs_human | \(.needs_human) |"' triage/triage.json
+
           {
-            echo "## Agentic triage"
             echo ""
-            echo "| Verdict | Count |"
-            echo "|---|---|"
-            jq -r '.findings | group_by(.verdict)[] | "| \(.[0].verdict) | \(length) |"' triage/triage.json
+            echo "Repository integrity check: **${{ steps.verify.outcome }}**"
             echo ""
-            echo "Tests on patched tree: **${{ steps.verify.outcome }}**"
+            echo "Fixes applied: **None (recommendations only)**"
             echo ""
             cat triage/report.md
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Comment on the pull request.
       - name: Comment on pull request
         if: steps.cfg.outputs.enabled == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
@@ -497,7 +528,7 @@ jobs:
             head -c 60000 triage/report.md
             echo ""
             echo ""
-            echo "_Proposed patch and full JSON are in the workflow artifacts. Tests on patched tree: ${{ steps.verify.outcome }}._"
+            echo "_No code changes or patches were applied. All remediation actions are recommendations only._"
           } > triage/comment.md
 
           gh pr comment "${{ github.event.pull_request.number }}" \
@@ -516,7 +547,6 @@ jobs:
   # ============================================================
   # 8. FINAL PIPELINE GATE
   #
-  # Runs after every other job, regardless of their outcomes.
   # Fails if ANY required job did not succeed.
   # ============================================================
   gate:
