@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+tests
+reports
+triage
+triage-input
+.ruff_cache
+.mypy_cache
+.pytest_cache

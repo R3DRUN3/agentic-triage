@@ -1,0 +1,320 @@
+name: DevSecOps + Agentic Triage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  GITLEAKS_VERSION: "8.21.2"
+  IMAGE_TAG: agentic-triage:ci
+
+jobs:
+  # ---------------------------------------------------------------- Quality
+  lint:
+    name: Lint (ruff, mypy, hadolint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Collect lint reports (never fails)
+        run: |
+          mkdir -p reports
+          ruff check . --output-format=json --exit-zero > reports/ruff.json
+          mypy > reports/mypy.txt || true
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          format: sarif
+          output-file: reports/hadolint.sarif
+          no-fail: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-lint
+          path: reports/
+          if-no-files-found: ignore
+      - name: Enforce lint
+        run: |
+          ruff check .
+          mypy
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Pytest
+        run: |
+          mkdir -p reports
+          pytest --junitxml=reports/junit.xml \
+                 --cov=app --cov-report=xml:reports/coverage.xml --cov-report=term
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-test
+          path: reports/
+          if-no-files-found: ignore
+
+  # --------------------------------------------------------------- Security
+  sast:
+    name: SAST (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install "bandit[sarif,toml]==1.7.10"
+      - name: Bandit (report only)
+        run: |
+          mkdir -p reports
+          bandit -r app -c pyproject.toml -f sarif -o reports/bandit.sarif --exit-zero
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-sast
+          path: reports/
+          if-no-files-found: ignore
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so old commits are scanned too
+      - name: Install gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+      - name: Gitleaks (report only)
+        run: |
+          mkdir -p reports
+          gitleaks detect --source . --config .gitleaks.toml \
+            --report-format sarif --report-path reports/gitleaks.sarif \
+            --redact --exit-code 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-secrets
+          path: reports/
+          if-no-files-found: ignore
+
+  container:
+    name: SCA / IaC / Image (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy filesystem scan (deps, misconfig, secrets)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,misconfig,secret
+          format: sarif
+          output: reports/trivy-fs.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          limit-severities-for-sarif: true
+          exit-code: "0"
+      - name: Build image
+        run: docker build -t "$IMAGE_TAG" .
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_TAG }}
+          format: sarif
+          output: reports/trivy-image.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          limit-severities-for-sarif: true
+          exit-code: "0"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-container
+          path: reports/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------- Agentic triage
+  triage:
+    name: Agentic triage (Codex + Azure Foundry)
+    needs: [lint, test, sast, secrets, container]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write # only to post the triage comment
+    env:
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      AZURE_OPENAI_DEPLOYMENT: ${{ vars.AZURE_OPENAI_DEPLOYMENT || 'gpt-5-codex' }}
+      CODEX_VERSION: ${{ vars.CODEX_VERSION || 'latest' }} # pin this in real use
+      CODEX_SANDBOX: ${{ vars.CODEX_SANDBOX || 'workspace-write' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # agent never sees the GitHub token
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install deps (so the agent can run tests offline)
+        run: pip install -r requirements-dev.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reports-*
+          path: reports
+          merge-multiple: true
+
+      - name: Normalize findings
+        run: python scripts/build_findings.py --reports reports --out triage-input
+
+      - name: Publish raw findings summary
+        run: cat triage-input/findings.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check Azure configuration
+        id: cfg
+        run: |
+          if [ -n "$AZURE_OPENAI_API_KEY" ] && [ -n "$AZURE_OPENAI_ENDPOINT" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Azure secrets not available (fork PR or not configured). Skipping agent."
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.cfg.outputs.enabled == 'true'
+        with:
+          node-version: "20"
+
+      - name: Install Codex CLI
+        if: steps.cfg.outputs.enabled == 'true'
+        run: npm install -g "@openai/codex@${CODEX_VERSION}"
+
+      - name: Configure Codex for Azure Foundry
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/codex-home"
+          ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
+          cat > "$RUNNER_TEMP/codex-home/config.toml" <<EOF
+          model = "${AZURE_OPENAI_DEPLOYMENT}"
+          model_provider = "azure"
+          model_reasoning_effort = "medium"
+          approval_policy = "never"
+
+          [model_providers.azure]
+          name = "Azure Foundry"
+          base_url = "${ENDPOINT}/openai/v1"
+          env_key = "AZURE_OPENAI_API_KEY"
+          wire_api = "responses"
+          EOF
+          echo "CODEX_HOME=$RUNNER_TEMP/codex-home" >> "$GITHUB_ENV"
+
+      - name: Run Codex triage
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          mkdir -p triage
+          codex exec \
+            --sandbox "$CODEX_SANDBOX" \
+            --skip-git-repo-check \
+            --output-last-message triage/last-message.md \
+            - < .github/codex/triage-prompt.md
+
+      - name: Capture proposed fixes as a patch
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          mkdir -p triage
+          git diff --binary > triage/fixes.patch
+          echo "Patch size: $(wc -c < triage/fixes.patch) bytes"
+          git diff --stat
+
+      - name: Verify proposed fixes (tests on patched tree)
+        id: verify
+        if: steps.cfg.outputs.enabled == 'true'
+        continue-on-error: true
+        run: pytest -q 2>&1 | tee triage/verify-tests.txt
+
+      - name: Validate and summarize triage output
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          jq -e '.findings | type == "array"' triage/triage.json > /dev/null
+          EXPECTED=$(jq 'length' triage-input/findings.json)
+          ACTUAL=$(jq '.findings | length' triage/triage.json)
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::warning::Agent triaged $ACTUAL of $EXPECTED findings"
+          fi
+          {
+            echo "## Agentic triage"
+            echo ""
+            echo "| Verdict | Count |"
+            echo "|---|---|"
+            jq -r '.findings | group_by(.verdict)[] | "| \(.[0].verdict) | \(length) |"' triage/triage.json
+            echo ""
+            echo "Tests on patched tree: **${{ steps.verify.outcome }}**"
+            echo ""
+            cat triage/report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on pull request
+        if: steps.cfg.outputs.enabled == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "<!-- agentic-triage -->"
+            echo "### Agentic triage report"
+            echo ""
+            head -c 60000 triage/report.md
+            echo ""
+            echo ""
+            echo "_Proposed patch and full JSON are in the workflow artifacts. Tests on patched tree: ${{ steps.verify.outcome }}._"
+          } > triage/comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body-file triage/comment.md --edit-last --create-if-none
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: triage-results
+          path: |
+            triage/
+            triage-input/
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------- Final gate
+  gate:
+    name: Gate
+    needs: [lint, test, sast, secrets, container, triage]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail on lint/test failure
+        run: |
+          echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }} triage=${{ needs.triage.result }}"
+          [ "${{ needs.lint.result }}" = "success" ] && [ "${{ needs.test.result }}" = "success" ]
