@@ -16,6 +16,7 @@ permissions:
 env:
   PYTHON_VERSION: "3.11"
   GITLEAKS_VERSION: "8.21.2"
+  TRIVY_VERSION: "0.58.1"
   IMAGE_TAG: agentic-triage:ci
 
 jobs:
@@ -68,7 +69,7 @@ jobs:
       - name: Pytest
         run: |
           mkdir -p reports
-          pytest --junitxml=reports/junit.xml \
+          python -m pytest --junitxml=reports/junit.xml \
                  --cov=app --cov-report=xml:reports/coverage.xml --cov-report=term
       - uses: actions/upload-artifact@v4
         if: always()
@@ -113,7 +114,13 @@ jobs:
       - name: Gitleaks (report only)
         run: |
           mkdir -p reports
-          gitleaks detect --source . --config .gitleaks.toml \
+          CONFIG_ARGS=""
+          if [ -f .gitleaks.toml ]; then
+            CONFIG_ARGS="--config .gitleaks.toml"
+          else
+            echo "::warning::.gitleaks.toml not found, using built-in default rules"
+          fi
+          gitleaks detect --source . $CONFIG_ARGS \
             --report-format sarif --report-path reports/gitleaks.sarif \
             --redact --exit-code 0
       - uses: actions/upload-artifact@v4
@@ -128,28 +135,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Trivy (pinned release binary)
+        run: |
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            | tar -xz trivy
+          sudo mv trivy /usr/local/bin/
+          trivy --version
       - name: Trivy filesystem scan (deps, misconfig, secrets)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: fs
-          scanners: vuln,misconfig,secret
-          format: sarif
-          output: reports/trivy-fs.sarif
-          severity: CRITICAL,HIGH,MEDIUM
-          limit-severities-for-sarif: true
-          exit-code: "0"
+        run: |
+          mkdir -p reports
+          trivy fs . \
+            --scanners vuln,misconfig,secret \
+            --skip-dirs reports,.git \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --format sarif --limit-severities-for-sarif \
+            --output reports/trivy-fs.sarif \
+            --exit-code 0
       - name: Build image
         run: docker build -t "$IMAGE_TAG" .
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: image
-          image-ref: ${{ env.IMAGE_TAG }}
-          format: sarif
-          output: reports/trivy-image.sarif
-          severity: CRITICAL,HIGH,MEDIUM
-          limit-severities-for-sarif: true
-          exit-code: "0"
+        run: |
+          trivy image "$IMAGE_TAG" \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --format sarif --limit-severities-for-sarif \
+            --output reports/trivy-image.sarif \
+            --exit-code 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -170,7 +180,8 @@ jobs:
     env:
       AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
       AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-      AZURE_OPENAI_DEPLOYMENT: ${{ vars.AZURE_OPENAI_DEPLOYMENT || 'gpt-5-codex' }}
+      # Deployment name (NOT the model name). Accepts either a secret or a variable.
+      AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT || vars.AZURE_OPENAI_DEPLOYMENT }}
       CODEX_VERSION: ${{ vars.CODEX_VERSION || 'latest' }} # pin this in real use
       CODEX_SANDBOX: ${{ vars.CODEX_SANDBOX || 'workspace-write' }}
     steps:
@@ -198,15 +209,52 @@ jobs:
       - name: Publish raw findings summary
         run: cat triage-input/findings.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Check Azure configuration
+      - name: Preflight Azure model endpoint
         id: cfg
         run: |
-          if [ -n "$AZURE_OPENAI_API_KEY" ] && [ -n "$AZURE_OPENAI_ENDPOINT" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
+          if [ -z "$AZURE_OPENAI_API_KEY" ] || [ -z "$AZURE_OPENAI_ENDPOINT" ] || [ -z "$AZURE_OPENAI_DEPLOYMENT" ]; then
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Azure secrets not available (fork PR or not configured). Skipping agent."
+            echo "::warning::Azure endpoint/key/deployment not available (fork PR or not configured). Skipping agent."
+            exit 0
           fi
+
+          # Normalize endpoint -> https://<resource>.<domain>/openai/v1
+          BASE="${AZURE_OPENAI_ENDPOINT%/}"
+          BASE="${BASE%/openai/v1}"
+          BASE="${BASE%/openai}"
+          BASE="${BASE}/openai/v1"
+
+          probe() { # $1 = path, $2 = JSON body
+            local code
+            code=$(curl -s -o probe.json -w '%{http_code}' -X POST "$BASE/$1" \
+              -H "Authorization: Bearer $AZURE_OPENAI_API_KEY" \
+              -H "Content-Type: application/json" -d "$2" || true)
+            echo "POST /$1 -> HTTP $code"
+            if [ "${code:0:1}" = "2" ]; then return 0; fi
+            head -c 400 probe.json; echo
+            return 1
+          }
+
+          RESP_BODY=$(jq -nc --arg m "$AZURE_OPENAI_DEPLOYMENT" \
+            '{model:$m,input:"Reply with OK",max_output_tokens:64}')
+          CHAT_BODY=$(jq -nc --arg m "$AZURE_OPENAI_DEPLOYMENT" \
+            '{model:$m,messages:[{role:"user",content:"Reply with OK"}],max_tokens:32}')
+
+          if probe responses "$RESP_BODY"; then
+            WIRE=responses
+          elif probe chat/completions "$CHAT_BODY"; then
+            WIRE=chat
+            echo "::warning::Deployment only supports chat/completions. Recent Codex versions require the Responses API. Pin an older CODEX_VERSION or use a Responses-capable deployment."
+          else
+            echo "::error::Deployment '$AZURE_OPENAI_DEPLOYMENT' failed on both /responses and /chat/completions. Check the deployment NAME, the endpoint and the key."
+            exit 1
+          fi
+          rm -f probe.json
+
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "CODEX_BASE_URL=$BASE" >> "$GITHUB_ENV"
+          echo "CODEX_WIRE_API=$WIRE" >> "$GITHUB_ENV"
+          echo "Using wire_api=$WIRE with deployment $AZURE_OPENAI_DEPLOYMENT"
 
       - uses: actions/setup-node@v4
         if: steps.cfg.outputs.enabled == 'true'
@@ -221,20 +269,19 @@ jobs:
         if: steps.cfg.outputs.enabled == 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/codex-home"
-          ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
           cat > "$RUNNER_TEMP/codex-home/config.toml" <<EOF
           model = "${AZURE_OPENAI_DEPLOYMENT}"
           model_provider = "azure"
-          model_reasoning_effort = "medium"
           approval_policy = "never"
 
           [model_providers.azure]
           name = "Azure Foundry"
-          base_url = "${ENDPOINT}/openai/v1"
+          base_url = "${CODEX_BASE_URL}"
           env_key = "AZURE_OPENAI_API_KEY"
-          wire_api = "responses"
+          wire_api = "${CODEX_WIRE_API}"
           EOF
           echo "CODEX_HOME=$RUNNER_TEMP/codex-home" >> "$GITHUB_ENV"
+          codex --version
 
       - name: Run Codex triage
         if: steps.cfg.outputs.enabled == 'true'
@@ -258,11 +305,15 @@ jobs:
         id: verify
         if: steps.cfg.outputs.enabled == 'true'
         continue-on-error: true
-        run: pytest -q 2>&1 | tee triage/verify-tests.txt
+        run: python -m pytest -q 2>&1 | tee triage/verify-tests.txt
 
       - name: Validate and summarize triage output
         if: steps.cfg.outputs.enabled == 'true'
         run: |
+          if [ ! -f triage/triage.json ] || [ ! -f triage/report.md ]; then
+            echo "::error::Agent did not produce triage/triage.json and triage/report.md"
+            exit 1
+          fi
           jq -e '.findings | type == "array"' triage/triage.json > /dev/null
           EXPECTED=$(jq 'length' triage-input/findings.json)
           ACTUAL=$(jq '.findings | length' triage/triage.json)

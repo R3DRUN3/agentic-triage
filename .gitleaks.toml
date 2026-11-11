@@ -1,0 +1,7 @@
+title = "agentic-triage gitleaks config"
+
+[extend]
+useDefault = true
+
+# Deliberately NO allowlist for tests/fixtures so the scanner reports it and
+# the agent has to decide whether it is a false positive.
