@@ -20,57 +20,82 @@ env:
   IMAGE_TAG: agentic-triage:ci
 
 jobs:
-  # ---------------------------------------------------------------- Quality
+
+  # ============================================================
+  # 1. LINT
+  # ============================================================
   lint:
     name: Lint (ruff, mypy, hadolint)
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: requirements*.txt
+
       - run: pip install -r requirements-dev.txt
-      - name: Collect lint reports (never fails)
+
+      # Generate reports without stopping at the first finding.
+      - name: Collect lint reports
         run: |
           mkdir -p reports
           ruff check . --output-format=json --exit-zero > reports/ruff.json
           mypy > reports/mypy.txt || true
+
       - name: Hadolint
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
           format: sarif
           output-file: reports/hadolint.sarif
-          no-fail: true
+          no-fail: false
+
+      # Always preserve reports, including when lint fails.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: reports-lint
           path: reports/
           if-no-files-found: ignore
+
+      # Actual enforcement.
       - name: Enforce lint
         run: |
+          set -e
           ruff check .
           mypy
 
+
+  # ============================================================
+  # 2. UNIT TESTS
+  # ============================================================
   test:
     name: Unit tests
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: requirements*.txt
+
       - run: pip install -r requirements-dev.txt
+
       - name: Pytest
         run: |
           mkdir -p reports
           python -m pytest --junitxml=reports/junit.xml \
-                 --cov=app --cov-report=xml:reports/coverage.xml --cov-report=term
+            --cov=app \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=term
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -78,20 +103,31 @@ jobs:
           path: reports/
           if-no-files-found: ignore
 
-  # --------------------------------------------------------------- Security
+
+  # ============================================================
+  # 3. SAST - BANDIT
+  # ============================================================
   sast:
     name: SAST (bandit)
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+
       - run: pip install "bandit[sarif,toml]==1.7.10"
-      - name: Bandit (report only)
+
+      - name: Bandit
         run: |
           mkdir -p reports
-          bandit -r app -c pyproject.toml -f sarif -o reports/bandit.sarif --exit-zero
+          bandit -r app \
+            -c pyproject.toml \
+            -f sarif \
+            -o reports/bandit.sarif
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -99,30 +135,46 @@ jobs:
           path: reports/
           if-no-files-found: ignore
 
+
+  # ============================================================
+  # 4. SECRET SCAN - GITLEAKS
+  # ============================================================
   secrets:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history so old commits are scanned too
+          fetch-depth: 0
+
       - name: Install gitleaks
         run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             | tar -xz gitleaks
+
           sudo mv gitleaks /usr/local/bin/
-      - name: Gitleaks (report only)
+
+      - name: Gitleaks
         run: |
           mkdir -p reports
+
           CONFIG_ARGS=""
           if [ -f .gitleaks.toml ]; then
             CONFIG_ARGS="--config .gitleaks.toml"
           else
             echo "::warning::.gitleaks.toml not found, using built-in default rules"
           fi
-          gitleaks detect --source . $CONFIG_ARGS \
-            --report-format sarif --report-path reports/gitleaks.sarif \
-            --redact --exit-code 0
+
+          gitleaks detect \
+            --source . \
+            $CONFIG_ARGS \
+            --report-format sarif \
+            --report-path reports/gitleaks.sarif \
+            --redact \
+            --exit-code 1
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -130,76 +182,152 @@ jobs:
           path: reports/
           if-no-files-found: ignore
 
-  container:
-    name: SCA / IaC / Image (trivy)
+
+  # ============================================================
+  # 5. TRIVY FILESYSTEM SCAN
+  # ============================================================
+  trivy_fs:
+    name: Trivy filesystem scan
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      - name: Install Trivy (pinned release, checksum verified)
+
+      - name: Install Trivy
         run: |
           set -euo pipefail
+
           BASE_URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
           TARBALL="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
           curl -sSfLO "${BASE_URL}/${TARBALL}"
           curl -sSfLO "${BASE_URL}/trivy_${TRIVY_VERSION}_checksums.txt"
-          sha256sum --check --ignore-missing "trivy_${TRIVY_VERSION}_checksums.txt"
+
+          sha256sum --check --ignore-missing \
+            "trivy_${TRIVY_VERSION}_checksums.txt"
+
           tar -xzf "${TARBALL}" trivy
           sudo mv trivy /usr/local/bin/
+
           rm -f "${TARBALL}" "trivy_${TRIVY_VERSION}_checksums.txt"
+
           trivy --version
-      - name: Trivy filesystem scan (deps, misconfig, secrets)
+
+      - name: Trivy filesystem scan
         run: |
           mkdir -p reports
+
           trivy fs . \
             --scanners vuln,misconfig,secret \
             --skip-dirs reports,.git \
             --severity CRITICAL,HIGH,MEDIUM \
             --format sarif \
             --output reports/trivy-fs.sarif \
-            --exit-code 0
+            --exit-code 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-trivy-fs
+          path: reports/
+          if-no-files-found: ignore
+
+
+  # ============================================================
+  # 6. TRIVY CONTAINER IMAGE SCAN
+  # ============================================================
+  trivy_image:
+    name: Trivy image scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+
+          BASE_URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          TARBALL="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+          curl -sSfLO "${BASE_URL}/${TARBALL}"
+          curl -sSfLO "${BASE_URL}/trivy_${TRIVY_VERSION}_checksums.txt"
+
+          sha256sum --check --ignore-missing \
+            "trivy_${TRIVY_VERSION}_checksums.txt"
+
+          tar -xzf "${TARBALL}" trivy
+          sudo mv trivy /usr/local/bin/
+
+          rm -f "${TARBALL}" "trivy_${TRIVY_VERSION}_checksums.txt"
+
+          trivy --version
+
       - name: Build image
         run: docker build -t "$IMAGE_TAG" .
+
       - name: Trivy image scan
         run: |
+          mkdir -p reports
+
           trivy image "$IMAGE_TAG" \
             --severity CRITICAL,HIGH,MEDIUM \
             --format sarif \
             --output reports/trivy-image.sarif \
-            --exit-code 0
+            --exit-code 1
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: reports-container
+          name: reports-trivy-image
           path: reports/
           if-no-files-found: ignore
 
-  # ---------------------------------------------------------- Agentic triage
+
+  # ============================================================
+  # 7. AGENTIC TRIAGE - CODEX
+  #
+  # Runs ONLY after all six independent jobs have completed.
+  # Still runs even if one or more jobs failed.
+  # ============================================================
   triage:
-    name: Agentic triage (Codex + Azure Foundry)
-    needs: [lint, test, sast, secrets, container]
+    name: Agentic triage
+
+    needs:
+      - lint
+      - test
+      - sast
+      - secrets
+      - trivy_fs
+      - trivy_image
+
     if: ${{ always() && !cancelled() }}
+
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     permissions:
       contents: read
-      pull-requests: write # only to post the triage comment
+      pull-requests: write
+
     env:
       AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
       AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-      # Deployment name (NOT the model name). Accepts either a secret or a variable.
       AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT || vars.AZURE_OPENAI_DEPLOYMENT }}
-      CODEX_VERSION: ${{ vars.CODEX_VERSION || 'latest' }} # pin this in real use
+      CODEX_VERSION: ${{ vars.CODEX_VERSION || 'latest' }}
       CODEX_SANDBOX: ${{ vars.CODEX_SANDBOX || 'workspace-write' }}
+
     steps:
       - uses: actions/checkout@v4
         with:
-          persist-credentials: false # agent never sees the GitHub token
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: requirements*.txt
+
       - name: Install deps (so the agent can run tests offline)
         run: pip install -r requirements-dev.txt
 
@@ -224,25 +352,31 @@ jobs:
             exit 0
           fi
 
-          # Normalize endpoint -> https://<resource>.<domain>/openai/v1
           BASE="${AZURE_OPENAI_ENDPOINT%/}"
           BASE="${BASE%/openai/v1}"
           BASE="${BASE%/openai}"
           BASE="${BASE}/openai/v1"
 
-          probe() { # $1 = path, $2 = JSON body
+          probe() {
             local code
             code=$(curl -s -o probe.json -w '%{http_code}' -X POST "$BASE/$1" \
               -H "Authorization: Bearer $AZURE_OPENAI_API_KEY" \
               -H "Content-Type: application/json" -d "$2" || true)
+
             echo "POST /$1 -> HTTP $code"
-            if [ "${code:0:1}" = "2" ]; then return 0; fi
-            head -c 400 probe.json; echo
+
+            if [ "${code:0:1}" = "2" ]; then
+              return 0
+            fi
+
+            head -c 400 probe.json
+            echo
             return 1
           }
 
           RESP_BODY=$(jq -nc --arg m "$AZURE_OPENAI_DEPLOYMENT" \
             '{model:$m,input:"Reply with OK",max_output_tokens:64}')
+
           CHAT_BODY=$(jq -nc --arg m "$AZURE_OPENAI_DEPLOYMENT" \
             '{model:$m,messages:[{role:"user",content:"Reply with OK"}],max_tokens:32}')
 
@@ -255,11 +389,13 @@ jobs:
             echo "::error::Deployment '$AZURE_OPENAI_DEPLOYMENT' failed on both /responses and /chat/completions. Check the deployment NAME, the endpoint and the key."
             exit 1
           fi
+
           rm -f probe.json
 
           echo "enabled=true" >> "$GITHUB_OUTPUT"
           echo "CODEX_BASE_URL=$BASE" >> "$GITHUB_ENV"
           echo "CODEX_WIRE_API=$WIRE" >> "$GITHUB_ENV"
+
           echo "Using wire_api=$WIRE with deployment $AZURE_OPENAI_DEPLOYMENT"
 
       - uses: actions/setup-node@v4
@@ -271,10 +407,11 @@ jobs:
         if: steps.cfg.outputs.enabled == 'true'
         run: npm install -g "@openai/codex@${CODEX_VERSION}"
 
-      - name: Configure Codex for Azure Foundry
+      - name: Configure Codex
         if: steps.cfg.outputs.enabled == 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/codex-home"
+
           cat > "$RUNNER_TEMP/codex-home/config.toml" <<EOF
           model = "${AZURE_OPENAI_DEPLOYMENT}"
           model_provider = "azure"
@@ -286,13 +423,16 @@ jobs:
           env_key = "AZURE_OPENAI_API_KEY"
           wire_api = "${CODEX_WIRE_API}"
           EOF
+
           echo "CODEX_HOME=$RUNNER_TEMP/codex-home" >> "$GITHUB_ENV"
+
           codex --version
 
       - name: Run Codex triage
         if: steps.cfg.outputs.enabled == 'true'
         run: |
           mkdir -p triage
+
           codex exec \
             --sandbox "$CODEX_SANDBOX" \
             --skip-git-repo-check \
@@ -303,8 +443,11 @@ jobs:
         if: steps.cfg.outputs.enabled == 'true'
         run: |
           mkdir -p triage
+
           git diff --binary > triage/fixes.patch
+
           echo "Patch size: $(wc -c < triage/fixes.patch) bytes"
+
           git diff --stat
 
       - name: Verify proposed fixes (tests on patched tree)
@@ -320,12 +463,16 @@ jobs:
             echo "::error::Agent did not produce triage/triage.json and triage/report.md"
             exit 1
           fi
+
           jq -e '.findings | type == "array"' triage/triage.json > /dev/null
+
           EXPECTED=$(jq 'length' triage-input/findings.json)
           ACTUAL=$(jq '.findings | length' triage/triage.json)
+
           if [ "$EXPECTED" != "$ACTUAL" ]; then
             echo "::warning::Agent triaged $ACTUAL of $EXPECTED findings"
           fi
+
           {
             echo "## Agentic triage"
             echo ""
@@ -352,6 +499,7 @@ jobs:
             echo ""
             echo "_Proposed patch and full JSON are in the workflow artifacts. Tests on patched tree: ${{ steps.verify.outcome }}._"
           } > triage/comment.md
+
           gh pr comment "${{ github.event.pull_request.number }}" \
             --body-file triage/comment.md --edit-last --create-if-none
 
@@ -364,14 +512,67 @@ jobs:
             triage-input/
           if-no-files-found: ignore
 
-  # -------------------------------------------------------------- Final gate
+
+  # ============================================================
+  # 8. FINAL PIPELINE GATE
+  #
+  # Runs after every other job, regardless of their outcomes.
+  # Fails if ANY required job did not succeed.
+  # ============================================================
   gate:
-    name: Gate
-    needs: [lint, test, sast, secrets, container, triage]
+    name: Final pipeline gate
+
+    needs:
+      - lint
+      - test
+      - sast
+      - secrets
+      - trivy_fs
+      - trivy_image
+      - triage
+
     if: ${{ always() && !cancelled() }}
+
     runs-on: ubuntu-latest
+
     steps:
-      - name: Fail on lint/test failure
+      - name: Evaluate all pipeline results
+        shell: bash
         run: |
-          echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }} triage=${{ needs.triage.result }}"
-          [ "${{ needs.lint.result }}" = "success" ] && [ "${{ needs.test.result }}" = "success" ]
+          echo "======================================"
+          echo "         PIPELINE RESULTS"
+          echo "======================================"
+
+          echo "Lint:          ${{ needs.lint.result }}"
+          echo "Unit tests:    ${{ needs.test.result }}"
+          echo "SAST:          ${{ needs.sast.result }}"
+          echo "Secrets:       ${{ needs.secrets.result }}"
+          echo "Trivy FS:      ${{ needs.trivy_fs.result }}"
+          echo "Trivy Image:   ${{ needs.trivy_image.result }}"
+          echo "Codex Triage:  ${{ needs.triage.result }}"
+
+          echo "======================================"
+
+          FAILED=0
+
+          for RESULT in \
+            "${{ needs.lint.result }}" \
+            "${{ needs.test.result }}" \
+            "${{ needs.sast.result }}" \
+            "${{ needs.secrets.result }}" \
+            "${{ needs.trivy_fs.result }}" \
+            "${{ needs.trivy_image.result }}" \
+            "${{ needs.triage.result }}"
+          do
+            if [ "$RESULT" != "success" ]; then
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::Pipeline FAILED. At least one required job did not succeed."
+            exit 1
+          fi
+
+          echo "All jobs completed successfully."
+          echo "Pipeline PASSED."
