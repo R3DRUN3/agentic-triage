@@ -16,7 +16,7 @@ permissions:
 env:
   PYTHON_VERSION: "3.11"
   GITLEAKS_VERSION: "8.21.2"
-  TRIVY_VERSION: "0.58.1"
+  TRIVY_VERSION: "0.76.2"
   IMAGE_TAG: agentic-triage:ci
 
 jobs:
@@ -135,11 +135,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Trivy (pinned release binary)
+      - name: Install Trivy (pinned release, checksum verified)
         run: |
-          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
-            | tar -xz trivy
+          set -euo pipefail
+          BASE_URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          TARBALL="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfLO "${BASE_URL}/${TARBALL}"
+          curl -sSfLO "${BASE_URL}/trivy_${TRIVY_VERSION}_checksums.txt"
+          sha256sum --check --ignore-missing "trivy_${TRIVY_VERSION}_checksums.txt"
+          tar -xzf "${TARBALL}" trivy
           sudo mv trivy /usr/local/bin/
+          rm -f "${TARBALL}" "trivy_${TRIVY_VERSION}_checksums.txt"
           trivy --version
       - name: Trivy filesystem scan (deps, misconfig, secrets)
         run: |
@@ -148,7 +154,7 @@ jobs:
             --scanners vuln,misconfig,secret \
             --skip-dirs reports,.git \
             --severity CRITICAL,HIGH,MEDIUM \
-            --format sarif --limit-severities-for-sarif \
+            --format sarif \
             --output reports/trivy-fs.sarif \
             --exit-code 0
       - name: Build image
@@ -157,7 +163,7 @@ jobs:
         run: |
           trivy image "$IMAGE_TAG" \
             --severity CRITICAL,HIGH,MEDIUM \
-            --format sarif --limit-severities-for-sarif \
+            --format sarif \
             --output reports/trivy-image.sarif \
             --exit-code 0
       - uses: actions/upload-artifact@v4
